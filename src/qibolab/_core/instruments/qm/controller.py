@@ -39,17 +39,42 @@ CALIBRATION_DB = "calibration_db.json"
 __all__ = ["Octave", "QmController"]
 
 MAX_VOLTAGE = 0.5
-"""Maximum output of Quantum Machines OPX+ in Volts."""
-MAX_VOLTAGE_AMPLIFIED = 2.5
-"""Maximum output of Quantum Machines OPX1000 FEMs in amplified mode in
+"""Maximum output of Quantum Machines OPX+ and OPX1000 LF-FEM (direct mode) in
 Volts."""
+MAX_VOLTAGE_AMPLIFIED = 2.5
+"""Maximum output of Quantum Machines OPX1000 LF-FEM in amplified mode in
+Volts."""
+MAX_AMPLITUDE_MW_FEM = 1.0
+"""Full-scale waveform amplitude of Quantum Machines OPX1000 MW-FEM outputs.
+
+MW-FEM waveforms are not expressed in Volts: samples in ``[-1, 1)`` are
+relative to the port's ``full_scale_power_dbm``
+(:attr:`MwFemOscillatorConfig.power`), with ``1`` delivering exactly that
+power. See
+https://docs.quantum-machines.co/latest/docs/Guides/opx1000_fems/#microwave-fem-mw-fem
+"""
 SAMPLING_RATE = 1
 """Sampling rate of Quantum Machines OPX+ in GSps."""
 
 
 def channel_max_voltage(config: Config):
-    """Find maximum voltage of a channel from the associated ``config``."""
-    if hasattr(config, "output_mode") and config.output_mode == "amplified":
+    """Full-scale waveform value of the output port described by ``config``.
+
+    A qibolab pulse ``amplitude`` of ``1`` is mapped to this value in the QM
+    ``config``:
+
+    - LF-FEM/OPX+ ports (:class:`OpxOutputConfig`): :data:`MAX_VOLTAGE_AMPLIFIED`
+      in ``"amplified"`` mode, :data:`MAX_VOLTAGE` otherwise (Volts);
+    - MW-FEM ports (:class:`MwFemOscillatorConfig`): :data:`MAX_AMPLITUDE_MW_FEM`,
+      i.e. the port's full-scale power.
+
+    ``config`` must be the config of the physical port, as returned by
+    :meth:`QmController.port_config` - for an MW-FEM ``IqChannel`` that is its
+    LO config, not its own :class:`IqConfig`.
+    """
+    if isinstance(config, MwFemOscillatorConfig):
+        return MAX_AMPLITUDE_MW_FEM
+    if getattr(config, "output_mode", None) == "amplified":
         return MAX_VOLTAGE_AMPLIFIED
     return MAX_VOLTAGE
 
@@ -439,16 +464,42 @@ class QmController(Controller):
                 probe_map[probe] = id
         return probe_map
 
+    def port_config(self, channel: ChannelId, configs: dict[str, Config]) -> Config:
+        """Config describing the physical output port that ``channel`` plays on.
+
+        This is where port-level properties (full-scale amplitude, sampling
+        rate) live, which differs per module type:
+
+        - ``DcChannel`` (LF-FEM/OPX+): its own :class:`OpxOutputConfig`, carrying
+          ``output_mode`` and ``sampling_rate``;
+        - ``IqChannel`` on an MW-FEM: its LO's :class:`MwFemOscillatorConfig`,
+          carrying ``power`` (full scale), ``band`` and ``sampling_rate`` - the
+          channel's own :class:`IqConfig` only holds its frequency;
+        - ``IqChannel`` through an Octave: its own config (OPX+/LF-FEM outputs
+          in direct mode at 1 GSps);
+        - ``AcquisitionChannel``: the port config of its probe channel.
+        """
+        ch = self.channels[channel]
+        if isinstance(ch, AcquisitionChannel):
+            assert ch.probe is not None
+            return self.port_config(ch.probe, configs)
+        if isinstance(ch, IqChannel) and ch.lo is not None:
+            lo_config = configs.get(ch.lo)
+            if isinstance(lo_config, MwFemOscillatorConfig):
+                return lo_config
+        return configs[channel]
+
     def register_pulse(
-        self, channel: ChannelId, config: Config, pulse: Pulse | Readout
+        self, channel: ChannelId, configs: dict[str, Config], pulse: Pulse | Readout
     ) -> str:
         """Add pulse in the QM ``config``.
 
         And return corresponding operation.
         """
         ch = self.channels[channel]
-        max_voltage = channel_max_voltage(config)
-        sampling_rate = channel_sampling_rate(config)
+        port_config = self.port_config(channel, configs)
+        max_voltage = channel_max_voltage(port_config)
+        sampling_rate = channel_sampling_rate(port_config)
         if isinstance(ch, DcChannel):
             assert isinstance(pulse, Pulse)
             return self.config.register_dc_pulse(
@@ -473,7 +524,7 @@ class QmController(Controller):
         """
         for id, pulse in sequence:
             if isinstance(pulse, (Pulse, Readout)):
-                self.register_pulse(id, configs[id], pulse)
+                self.register_pulse(id, configs, pulse)
 
     def register_duration_sweeper_pulses(
         self, args: ExecutionArguments, configs: dict[str, Config], sweeper: Sweeper
@@ -494,13 +545,16 @@ class QmController(Controller):
                 continue
 
             ids = args.sequence.pulse_channels(pulse.id)
-            sampling_rate = channel_sampling_rate(configs[ids[0]])
+            sampling_rate = channel_sampling_rate(self.port_config(ids[0], configs))
 
             if not abs(sweeper.values[1] - sweeper.values[0]).is_integer():
                 assert sweeper.parameter is Parameter.duration
                 assert sampling_rate > 1
             for _id in ids:
-                assert channel_sampling_rate(configs[_id]) == sampling_rate
+                assert (
+                    channel_sampling_rate(self.port_config(_id, configs))
+                    == sampling_rate
+                )
 
             params = args.parameters[pulse.id]
 
@@ -514,7 +568,7 @@ class QmController(Controller):
                     update={"duration": int(min(sweeper.values))}
                 )
                 params.interpolated_op = self.register_pulse(
-                    ids[0], configs[ids[0]], sweep_pulse
+                    ids[0], configs, sweep_pulse
                 )
             else:
                 assert sweeper.parameter is Parameter.duration
@@ -522,7 +576,7 @@ class QmController(Controller):
                     sweep_pulse = original_pulse.model_copy(
                         update={"duration": duration}
                     )
-                    sweep_op = self.register_pulse(ids[0], configs[ids[0]], sweep_pulse)
+                    sweep_op = self.register_pulse(ids[0], configs, sweep_pulse)
                     nsamples = int(sampling_rate * duration)
                     params.duration_ops.append((nsamples, sweep_op))
 
@@ -540,9 +594,7 @@ class QmController(Controller):
             ids = args.sequence.pulse_channels(pulse.id)
             params = args.parameters[pulse.id]
             params.amplitude_pulse = sweep_pulse
-            params.amplitude_op = self.register_pulse(
-                ids[0], configs[ids[0]], sweep_pulse
-            )
+            params.amplitude_op = self.register_pulse(ids[0], configs, sweep_pulse)
 
     def register_acquisitions(
         self,
@@ -560,9 +612,9 @@ class QmController(Controller):
             if not isinstance(readout, Readout):
                 continue
 
-            probe_id = self.channels[channel_id].probe
-            max_voltage = channel_max_voltage(configs[probe_id])
-            sampling_rate = channel_sampling_rate(configs[probe_id])
+            port_config = self.port_config(channel_id, configs)
+            max_voltage = channel_max_voltage(port_config)
+            sampling_rate = channel_sampling_rate(port_config)
             op = self.config.register_acquisition_pulse(
                 channel_id, readout, sampling_rate, max_voltage
             )
@@ -602,7 +654,9 @@ class QmController(Controller):
         for sweeper in find_sweepers(sweepers, Parameter.offset):
             for id in sweeper.channels:
                 args.parameters[id].element = id
-                args.parameters[id].max_offset = channel_max_voltage(configs[id])
+                args.parameters[id].max_offset = channel_max_voltage(
+                    self.port_config(id, configs)
+                )
         for sweeper in find_sweepers(sweepers, Parameter.amplitude):
             self.register_amplitude_sweeper_pulses(args, configs, sweeper)
         for sweeper in find_sweepers(sweepers, Parameter.duration):
